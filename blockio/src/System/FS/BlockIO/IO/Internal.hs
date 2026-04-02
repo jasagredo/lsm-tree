@@ -86,7 +86,13 @@ tryLockFileIO :: HasFS IO HandleIO -> FsPath -> GHC.LockMode -> IO (Maybe (LockF
 tryLockFileIO hfs fsp mode = do
     fp <- FS.unsafeToFilePath hfs fsp -- shouldn't fail because we are in IO
     rethrowFsErrorIO hfs fsp $
-      bracketOnError (GHC.openFile fp GHC.WriteMode) GHC.hClose $ \h -> do
+      -- SharedLock (F_RDLCK) requires the fd to be open for reading on Linux.
+      -- ExclusiveLock (F_WRLCK) works with a write-only fd, and WriteMode
+      -- creates the file if it does not yet exist (needed for the session lock).
+      let openMode = case mode of
+            GHC.SharedLock    -> GHC.ReadWriteMode
+            GHC.ExclusiveLock -> GHC.WriteMode
+      in bracketOnError (GHC.openFile fp openMode) GHC.hClose $ \h -> do
         bracketOnError (GHC.hTryLock h mode) (\_ -> GHC.hUnlock h) $ \b -> do
           if b then
             pure $ Just LockFileHandle { hUnlock = rethrowFsErrorIO hfs fsp $ do

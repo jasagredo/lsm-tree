@@ -21,13 +21,16 @@ module Database.LSMTree.Internal.Snapshot (
     -- * Write buffer
   , snapshotWriteBuffer
   , openWriteBuffer
+  , openWriteBufferInPlace
     -- * Run
   , SnapshotRun (..)
   , snapshotRun
   , openRun
+  , openRunInPlace
     -- * Opening snapshot formats
     -- ** Levels format
   , fromSnapLevels
+  , fromSnapLevelsReadOnly
     -- ** Merging Tree format
   , fromSnapMergingTree
     -- * Hard links
@@ -48,6 +51,7 @@ import           Data.Foldable (sequenceA_, traverse_)
 import           Data.String (IsString)
 import           Data.Text (Text)
 import qualified Data.Vector as V
+import qualified Database.LSMTree.Internal.BlobFile as BlobFile
 import qualified Database.LSMTree.Internal.BloomFilter as Bloom
 import           Database.LSMTree.Internal.Config
 import           Database.LSMTree.Internal.CRC32C (checkCRC)
@@ -532,6 +536,41 @@ openWriteBuffer reg resolve hfs hbio refCtx uc activeDir snapWriteBufferPaths = 
       WBR.readWriteBuffer resolve hfs hbio kOpsPath (WBB.blobFile wbb)
   pure (writeBuffer, writeBufferBlobs)
 
+{-# SPECIALISE openWriteBufferInPlace ::
+       ActionRegistry IO -> ResolveSerialisedValue
+    -> HasFS IO h -> HasBlockIO IO h -> RefCtx
+    -> WriteBufferFsPaths
+    -> IO (WriteBuffer, Ref (WriteBufferBlobs IO h)) #-}
+-- | Like 'openWriteBuffer' but reads the blob file in-place from the snapshot
+-- directory without copying it to the active directory.
+openWriteBufferInPlace ::
+     (MonadMVar m, MonadMask m, MonadSTM m, MonadST m)
+  => ActionRegistry m -> ResolveSerialisedValue
+  -> HasFS m h -> HasBlockIO m h -> RefCtx
+  -> WriteBufferFsPaths
+  -> m (WriteBuffer, Ref (WriteBufferBlobs m h))
+openWriteBufferInPlace reg resolve hfs hbio refCtx snapWriteBufferPaths = do
+  (expectedChecksumForKOps, expectedChecksumForBlob) <-
+    CRC.expectValidFile hfs (writeBufferChecksumsPath snapWriteBufferPaths) CRC.FormatWriteBufferFile
+        . fromChecksumsFileForWriteBufferFiles
+      =<< CRC.readChecksumsFile hfs (writeBufferChecksumsPath snapWriteBufferPaths)
+  checkCRC hfs hbio False (unForKOps expectedChecksumForKOps) (writeBufferKOpsPath snapWriteBufferPaths)
+  checkCRC hfs hbio False (unForBlob expectedChecksumForBlob) (writeBufferBlobPath snapWriteBufferPaths)
+  -- Open blob file directly from snapshot dir (no copy to active dir).
+  -- Mirror the pattern of WBB.open: bundle openBlobFileShared + fromBlobFile
+  -- into one action so the registry tracks only writeBufferBlobs, avoiding a
+  -- double-release of blobFile on rollback.
+  writeBufferBlobs <- withRollback reg
+    (bracketOnError
+       (BlobFile.openBlobFileShared hfs refCtx (writeBufferBlobPath snapWriteBufferPaths) FS.ReadMode)
+       releaseRef
+       (WBB.fromBlobFile hfs refCtx))
+    releaseRef
+  let kOpsPath = ForKOps (writeBufferKOpsPath snapWriteBufferPaths)
+  writeBuffer <- withRef writeBufferBlobs $ \wbb ->
+      WBR.readWriteBuffer resolve hfs hbio kOpsPath (WBB.blobFile wbb)
+  pure (writeBuffer, writeBufferBlobs)
+
 {-------------------------------------------------------------------------------
   Runs
 -------------------------------------------------------------------------------}
@@ -630,6 +669,24 @@ openRun hfs hbio refCtx uc reg
       (Run.openFromDisk hfs hbio refCtx caching indexType expectedSalt targetPaths)
       releaseRef
 
+{-# SPECIALISE openRunInPlace ::
+     HasFS IO h -> HasBlockIO IO h -> RefCtx -> ActionRegistry IO
+  -> NamedSnapshotDir -> Bloom.Salt -> SnapshotRun -> IO (Ref (Run IO h)) #-}
+-- | Like 'openRun' but opens run files in-place from the snapshot directory
+-- without hard-linking them into the active directory and without taking
+-- ownership (files are not deleted on release).
+openRunInPlace ::
+     (MonadMask m, MonadSTM m, MonadST m)
+  => HasFS m h -> HasBlockIO m h -> RefCtx -> ActionRegistry m
+  -> NamedSnapshotDir -> Bloom.Salt -> SnapshotRun
+  -> m (Ref (Run m h))
+openRunInPlace hfs hbio refCtx reg (NamedSnapshotDir sourceDir) expectedSalt
+               SnapshotRun{snapRunNumber, snapRunCaching, snapRunIndex} =
+    withRollback reg
+      (Run.openFromDiskInPlace hfs hbio refCtx snapRunCaching snapRunIndex expectedSalt
+           (RunFsPaths sourceDir snapRunNumber))
+      releaseRef
+
 {-------------------------------------------------------------------------------
   Opening from levels snapshot format
 -------------------------------------------------------------------------------}
@@ -696,6 +753,42 @@ fromSnapLevels hfs hbio refCtx salt uc conf resolve reg dir (SnapLevels levels) 
         -- all the merging credits already.
         supplyCreditsIncomingRun refCtx conf ln ir nominalCredits
         pure ir
+
+-- | Like 'fromSnapLevels' but for 'SnapshotReader' sessions. Does not create
+-- any files in the active directory and does not restore merge progress.
+-- Ongoing merges are flattened: source runs become additional resident runs
+-- in the same level, preserving correctness of lookups at the cost of
+-- not resuming merge work.
+fromSnapLevelsReadOnly ::
+     forall m h. (MonadMask m, MonadMVar m, MonadSTM m, MonadST m)
+  => ActionRegistry m -> RefCtx -> SnapLevels (Ref (Run m h)) -> m (Levels m h)
+fromSnapLevelsReadOnly reg refCtx (SnapLevels levels) =
+    V.forM levels fromSnapLevelReadOnly
+  where
+    fromSnapLevelReadOnly :: SnapLevel (Ref (Run m h)) -> m (Level m h)
+    fromSnapLevelReadOnly SnapLevel{snapIncoming, snapResidentRuns} = do
+      (incomingRun, extraRuns) <- fromSnapIncomingReadOnly snapIncoming
+      residentRuns <- V.forM (snapResidentRuns V.++ extraRuns) $ \r ->
+                        withRollback reg (dupRef r) releaseRef
+      pure Level { incomingRun, residentRuns }
+
+    fromSnapIncomingReadOnly ::
+         SnapIncomingRun (Ref (Run m h))
+      -> m (IncomingRun m h, V.Vector (Ref (Run m h)))
+    fromSnapIncomingReadOnly (SnapIncomingSingleRun r) = do
+      ir <- withRollback reg (newIncomingSingleRun r) releaseIncomingRun
+      pure (ir, V.empty)
+    fromSnapIncomingReadOnly (SnapIncomingMergingRun _ _ _ smr) =
+      case smr of
+        SnapCompletedMerge _ r -> do
+          ir <- withRollback reg (newIncomingSingleRun r) releaseIncomingRun
+          pure (ir, V.empty)
+        SnapOngoingMerge _ _ rs _ ->
+          case V.uncons rs of
+            Nothing         -> error "fromSnapLevelsReadOnly: empty ongoing merge"
+            Just (r, extra) -> do
+              ir <- withRollback reg (newIncomingSingleRun r) releaseIncomingRun
+              pure (ir, extra)
 
 {-# SPECIALISE fromSnapMergingRun ::
      MR.IsMergeType t

@@ -42,9 +42,11 @@ module Database.LSMTree.Internal.Unsafe (
   , withKeepSessionOpen
     -- ** Implementation of public API
   , withOpenSession
+  , withOpenReaderSession
   , withNewSession
   , withRestoreSession
   , openSession
+  , openReaderSession
   , newSession
   , restoreSession
   , closeSession
@@ -110,7 +112,7 @@ import           Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import           Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import           Data.Maybe (catMaybes, maybeToList)
+import           Data.Maybe (catMaybes, maybeToList, isNothing)
 import qualified Data.Set as Set
 import           Data.Text (Text)
 import qualified Data.Text as Text
@@ -396,6 +398,15 @@ data Session m h = Session {
 instance NFData (Session m h) where
   rnf (Session a b c d) = rnf a `seq` rwhnf b `seq` rwhnf c `seq` rnf d
 
+-- | Determines how a session was opened and which operations are permitted.
+data SessionMode
+  = ReadWrite    -- ^ Full read\/write access; holds exclusive lock on the
+                 --   session directory.
+  | SnapshotReader  -- ^ Read-only access to named snapshots only; holds no
+                    --   session-level lock. Can coexist with a 'ReadWrite'
+                    --   session in the same directory.
+  deriving stock (Show, Eq)
+
 data SessionState m h =
     SessionOpen !(SessionEnv m h)
   | SessionClosed
@@ -415,7 +426,8 @@ data SessionEnv m h = SessionEnv {
   , sessionSalt        :: !Bloom.Salt
   , sessionHasFS       :: !(HasFS m h)
   , sessionHasBlockIO  :: !(HasBlockIO m h)
-  , sessionLockFile    :: !(FS.LockFileHandle m)
+  , sessionLockFile    :: !(Maybe (FS.LockFileHandle m))
+  , sessionMode        :: !SessionMode
     -- | Open tables are tracked here so they can be closed once the session is
     -- closed. Tables also become untracked when they are closed manually.
     --
@@ -629,7 +641,7 @@ newSession tr hfs hbio salt dir = do
         (FS.createDirectory hfs snapshotsDirPath)
         (FS.removeDirectoryRecursive hfs snapshotsDirPath)
 
-      mkSession tr hfs hbio reg root sessionFileLock salt
+      mkSession tr hfs hbio reg root (Just sessionFileLock) ReadWrite salt
   where
     sessionTracer = TraceSession (SessionId dir) `contramap` tr
 
@@ -697,7 +709,7 @@ restoreSession tr hfs hbio dir = do
       checkActiveDirLayout
       checkSnapshotsDirLayout
 
-      mkSession tr hfs hbio reg root sessionFileLock salt
+      mkSession tr hfs hbio reg root (Just sessionFileLock) ReadWrite salt
   where
     sessionTracer = TraceSession (SessionId dir) `contramap` tr
 
@@ -741,6 +753,67 @@ restoreSession tr hfs hbio dir = do
     -- Nothing to check: snapshots are verified when they are loaded, not when a
     -- session is restored.
     checkSnapshotsDirLayout = pure ()
+
+{-# SPECIALISE openReaderSession ::
+     Tracer IO LSMTreeTrace -> HasFS IO h -> HasBlockIO IO h
+  -> FsPath -> IO (Session IO h) #-}
+-- | Open a session in 'SnapshotReader' mode. Does not acquire a session-level
+-- lock, so it can coexist with a 'ReadWrite' session on the same directory.
+-- The caller may only call 'openTableFromSnapshot', 'listSnapshots', and
+-- 'doesSnapshotExist'. Write operations on the resulting tables are not
+-- prevented at the type level but will fail or produce undefined behaviour.
+openReaderSession ::
+     forall m h.
+     (MonadSTM m, MonadMVar m, PrimMonad m, MonadMask m, MonadEvaluate m)
+  => Tracer m LSMTreeTrace
+  -> HasFS m h
+  -> HasBlockIO m h
+  -> FsPath
+  -> m (Session m h)
+openReaderSession tr hfs hbio dir = do
+    traceWith sessionTracer TraceOpenSession
+    dirExists <- FS.doesDirectoryExist hfs dir
+    unless dirExists $
+      throwIO (ErrSessionDirDoesNotExist (FS.mkFsErrorPath hfs dir))
+    b <- isSessionDirEmpty hfs dir
+    when b $
+      throwIO (ErrSessionDirCorrupted
+                 (Text.pack "Session directory is empty; cannot open as SnapshotReader")
+                 (FS.mkFsErrorPath hfs dir))
+    withActionRegistry $ \reg -> do
+      checkTopLevelDirLayout
+      salt <- FS.withFile hfs metadataFilePath FS.ReadMode $ \h -> do
+        bs <- FS.hGetAll hfs h
+        evaluate $ S.deserialise bs
+      mkSession tr hfs hbio reg root Nothing SnapshotReader salt
+  where
+    sessionTracer    = TraceSession (SessionId dir) `contramap` tr
+    root             = Paths.SessionRoot dir
+    metadataFilePath = Paths.metadataFile root
+    activeDirPath    = Paths.getActiveDir (Paths.activeDir root)
+    snapshotsDirPath = Paths.snapshotsDir root
+    checkTopLevelDirLayout = do
+      FS.doesFileExist hfs metadataFilePath >>= \b ->
+        unless b $ throwIO $
+          ErrSessionDirCorrupted (Text.pack "Missing metadata file")
+            (FS.mkFsErrorPath hfs metadataFilePath)
+      FS.doesDirectoryExist hfs activeDirPath >>= \b ->
+        unless b $ throwIO $
+          ErrSessionDirCorrupted (Text.pack "Missing active directory")
+            (FS.mkFsErrorPath hfs activeDirPath)
+      FS.doesDirectoryExist hfs snapshotsDirPath >>= \b ->
+        unless b $ throwIO $
+          ErrSessionDirCorrupted (Text.pack "Missing snapshots directory")
+            (FS.mkFsErrorPath hfs snapshotsDirPath)
+
+{-# INLINE withOpenReaderSession #-}
+withOpenReaderSession ::
+     forall m h a.
+     (MonadSTM m, MonadMVar m, PrimMonad m, MonadMask m, MonadEvaluate m)
+  => Tracer m LSMTreeTrace -> HasFS m h -> HasBlockIO m h -> FsPath
+  -> (Session m h -> m a) -> m a
+withOpenReaderSession tr hfs hbio dir =
+    bracket (openReaderSession tr hfs hbio dir) closeSession
 
 {-# SPECIALISE closeSession :: Session IO h -> IO () #-}
 -- | See 'Database.LSMTree.closeSession'.
@@ -788,7 +861,7 @@ closeSession Session{sessionState, sessionTracer} = do
               (void . swapMVar (sessionOpenTables seshEnv))
           mapM_ (delayedCommit reg . close) tables
 
-          delayedCommit reg $ FS.hUnlock (sessionLockFile seshEnv)
+          traverse_ (delayedCommit reg . FS.hUnlock) (sessionLockFile seshEnv)
 
         -- Note: we're "abusing" the action registry to trace the success
         -- message as late as possible.
@@ -840,7 +913,8 @@ acquireSessionLock hfs hbio reg lockFilePath = do
   -> HasBlockIO IO h
   -> ActionRegistry IO
   -> SessionRoot
-  -> FS.LockFileHandle IO
+  -> Maybe (FS.LockFileHandle IO)
+  -> SessionMode
   -> Bloom.Salt
   -> IO (Session IO h) #-}
 mkSession ::
@@ -850,10 +924,11 @@ mkSession ::
   -> HasBlockIO m h
   -> ActionRegistry m
   -> SessionRoot
-  -> FS.LockFileHandle m
+  -> Maybe (FS.LockFileHandle m)
+  -> SessionMode
   -> Bloom.Salt
   -> m (Session m h)
-mkSession tr hfs hbio reg root@(SessionRoot dir) lockFile salt = do
+mkSession tr hfs hbio reg root@(SessionRoot dir) mLockFile mode salt = do
     counterVar <- newUniqCounter 0
     refCtx <- newRefCtx
     openTablesVar <- newMVar Map.empty
@@ -863,7 +938,8 @@ mkSession tr hfs hbio reg root@(SessionRoot dir) lockFile salt = do
       , sessionSalt = salt
       , sessionHasFS = hfs
       , sessionHasBlockIO = hbio
-      , sessionLockFile = lockFile
+      , sessionLockFile = mLockFile
+      , sessionMode = mode
       , sessionOpenTables = openTablesVar
       , sessionOpenCursors = openCursorsVar
       , sessionRefCtx = refCtx
@@ -948,6 +1024,9 @@ data TableEnv m h = TableEnv {
     --
     -- TODO: switch to more fine-grained synchronisation approach
   , tableContent    :: !(RWVar m (TableContent m h))
+    -- | Held for the lifetime of a table opened from a snapshot in
+    -- 'SnapshotReader' mode. 'Nothing' for all other tables.
+  , tableSnapshotLock :: !(Maybe (FS.LockFileHandle m))
   }
 
 {-# INLINE tableSessionRoot #-}
@@ -1049,7 +1128,7 @@ new sesh conf = do
       withActionRegistry $ \reg -> do
         am <- newArenaManager
         tc <- newEmptyTableContent (sessionUniqCounter sesh) seshEnv reg
-        newWith reg sesh seshEnv conf am tr tableId tc
+        newWith reg sesh seshEnv conf am tr tableId Nothing tc
 
 {-# SPECIALISE newEmptyTableContent ::
      UniqCounter IO
@@ -1089,6 +1168,7 @@ newEmptyTableContent uc seshEnv reg = do
   -> ArenaManager RealWorld
   -> Tracer IO TableTrace
   -> TableId
+  -> Maybe (FS.LockFileHandle IO)
   -> TableContent IO h
   -> IO (Table IO h) #-}
 newWith ::
@@ -1100,9 +1180,10 @@ newWith ::
   -> ArenaManager (PrimState m)
   -> Tracer m TableTrace
   -> TableId
+  -> Maybe (FS.LockFileHandle m)
   -> TableContent m h
   -> m (Table m h)
-newWith reg sesh seshEnv conf !am !tr !tableId !tc = do
+newWith reg sesh seshEnv conf !am !tr !tableId !mSnapLock !tc = do
     -- The session is kept open until we've updated the session's set of tracked
     -- tables. If 'closeSession' is called by another thread while this code
     -- block is being executed, that thread will block until it reads the
@@ -1111,6 +1192,7 @@ newWith reg sesh seshEnv conf !am !tr !tableId !tc = do
     tableVar <- RW.new $ TableOpen $ TableEnv {
           tableSessionEnv = seshEnv
         , tableContent = contentVar
+        , tableSnapshotLock = mSnapLock
         }
     let !t = Table conf tableVar am tr tableId sesh
     -- Track the current table
@@ -1144,6 +1226,7 @@ close t = do
         delayedCommit reg (tableSessionUntrackTable (tableId t) tEnv)
         RW.withWriteAccess_ (tableContent tEnv) $ \tc -> do
           releaseTableContent reg tc
+          traverse_ (delayedCommit reg . FS.hUnlock) (tableSnapshotLock tEnv)
           pure tc
 
         -- Note: we're "abusing" the action registry to trace the success
@@ -1704,6 +1787,12 @@ saveSnapshot snap label t = do
             SnapshotMetaDataChecksumFile checksumPath = Paths.snapshotMetaDataChecksumFile snapDir
         writeFileSnapshotMetaData hfs contentPath checksumPath snapMetaData
 
+        -- Create the lock file that readers and the delete path use for
+        -- coordination. Must be created before the directory sync so it is
+        -- durable when the snapshot becomes visible.
+        FS.withFile hfs (Paths.snapshotLockFile snapDir)
+                        (FS.WriteMode FS.MustBeNew) $ \_ -> pure ()
+
         -- Make the directory and its contents durable.
         FS.synchroniseDirectoryRecursive hfs hbio (Paths.getNamedSnapshotDir snapDir)
 
@@ -1738,6 +1827,13 @@ data SnapshotNotCompatibleError
     deriving stock (Show, Eq)
     deriving anyclass (Exception)
 
+
+-- | The snapshot is currently held open by a reader and cannot be deleted.
+data SnapshotInUseError
+    = ErrSnapshotInUse !SnapshotName
+    deriving stock (Show, Eq)
+    deriving anyclass (Exception)
+
 {-# SPECIALISE openTableFromSnapshot ::
      TableConfigOverride
   -> Session IO h
@@ -1747,6 +1843,7 @@ data SnapshotNotCompatibleError
   -> IO (Table IO h) #-}
 -- |  See 'Database.LSMTree.openTableFromSnapshot'.
 openTableFromSnapshot ::
+     forall m h.
      (MonadMask m, MonadMVar m, MonadST m, MonadSTM m)
   => TableConfigOverride
   -> Session m h
@@ -1785,40 +1882,74 @@ openTableFromSnapshot policyOveride sesh snap label resolve = do
         am <- newArenaManager
 
         let salt = sessionSalt seshEnv
-        let activeDir = Paths.activeDir (sessionRoot seshEnv)
+        case sessionMode seshEnv of
 
-        -- Read write buffer
-        let snapWriteBufferPaths = Paths.WriteBufferFsPaths (Paths.getNamedSnapshotDir snapDir) snapWriteBuffer
-        (tableWriteBuffer, tableWriteBufferBlobs) <-
-          openWriteBuffer reg resolve hfs hbio (sessionRefCtx seshEnv) uc activeDir snapWriteBufferPaths
-
-        -- Hard link runs into the active directory,
-        snapLevels' <- traverse (openRun hfs hbio (sessionRefCtx seshEnv) uc reg snapDir activeDir salt) snapLevels
-        unionLevel <- case mTreeOpt of
+          -- ── ReadWrite: hard-links into active dir ──────
+          ReadWrite -> do
+            let activeDir = Paths.activeDir (sessionRoot seshEnv)
+                snapWriteBufferPaths =
+                  Paths.WriteBufferFsPaths (Paths.getNamedSnapshotDir snapDir) snapWriteBuffer
+            (tableWriteBuffer, tableWriteBufferBlobs) <-
+              openWriteBuffer reg resolve hfs hbio (sessionRefCtx seshEnv) uc activeDir snapWriteBufferPaths
+            snapLevels' <- traverse
+              (openRun hfs hbio (sessionRefCtx seshEnv) uc reg snapDir activeDir salt) snapLevels
+            unionLevel <- case mTreeOpt of
               Nothing -> pure NoUnion
               Just mTree -> do
-                snapTree <- traverse (openRun hfs hbio (sessionRefCtx seshEnv) uc reg snapDir activeDir salt) mTree
+                snapTree <- traverse
+                  (openRun hfs hbio (sessionRefCtx seshEnv) uc reg snapDir activeDir salt) mTree
                 mt <- fromSnapMergingTree hfs hbio (sessionRefCtx seshEnv) salt uc resolve activeDir reg snapTree
                 isStructurallyEmpty mt >>= \case
-                  True ->
-                    pure NoUnion
+                  True  -> pure NoUnion
                   False -> do
                     traverse_ (delayedCommit reg . releaseRef) snapTree
                     cache <- mkUnionCache reg mt
                     pure (Union mt cache)
+            tableLevels <- fromSnapLevels hfs hbio (sessionRefCtx seshEnv) salt uc conf resolve reg activeDir snapLevels'
+            traverse_ (delayedCommit reg . releaseRef) snapLevels'
+            tableCache <- mkLevelsCache reg tableLevels
+            newWith reg sesh seshEnv conf am tr tableId Nothing $! TableContent
+              { tableWriteBuffer, tableWriteBufferBlobs, tableLevels
+              , tableCache, tableUnionLevel = unionLevel }
 
-        -- Convert from the snapshot format, restoring merge progress in the process
-        tableLevels <- fromSnapLevels hfs hbio (sessionRefCtx seshEnv) salt uc conf resolve reg activeDir snapLevels'
-        traverse_ (delayedCommit reg . releaseRef) snapLevels'
+          -- ── SnapshotReader: in-place opens, snapshot lock held ────────────
+          SnapshotReader -> do
+            let lockPath = Paths.snapshotLockFile snapDir
+            -- Acquire a shared lock BEFORE opening any snapshot files. This
+            -- prevents the writer from deleting the snapshot while we open it.
+            elock <- try @m @FsError $ FS.tryLockFile hbio lockPath FS.SharedLock
+            snapLock <- case elock of
+              Left e
+                | FS.FsResourceDoesNotExist <- FS.fsErrorType e ->
+                    throwIO (ErrSnapshotDoesNotExist snap)   -- dir was deleted
+                | otherwise -> throwIO e
+              Right Nothing ->
+                throwIO (ErrSnapshotDoesNotExist snap)       -- exclusive lock = deletion in progress
+              Right (Just lock) -> do
+                -- Guard against the race where deletion completes between the
+                -- initial doesDirectoryExist check and the lock acquisition.
+                stillExists <- FS.doesDirectoryExist hfs (Paths.getNamedSnapshotDir snapDir)
+                if stillExists then pure lock
+                               else FS.hUnlock lock >> throwIO (ErrSnapshotDoesNotExist snap)
 
-        tableCache <- mkLevelsCache reg tableLevels
-        newWith reg sesh seshEnv conf am tr tableId $! TableContent {
-            tableWriteBuffer
-          , tableWriteBufferBlobs
-          , tableLevels
-          , tableCache
-          , tableUnionLevel = unionLevel
-          }
+            -- With the shared lock held, snapshot files are stable.
+            let snapWriteBufferPaths =
+                  Paths.WriteBufferFsPaths (Paths.getNamedSnapshotDir snapDir) snapWriteBuffer
+            (tableWriteBuffer, tableWriteBufferBlobs) <-
+              openWriteBufferInPlace reg resolve hfs hbio (sessionRefCtx seshEnv) snapWriteBufferPaths
+            snapLevels' <- traverse
+              (openRunInPlace hfs hbio (sessionRefCtx seshEnv) reg snapDir salt) snapLevels
+            -- Union/MergingTree is not yet supported in SnapshotReader mode.
+            unless (isNothing mTreeOpt) $
+              throwIO (userError "blah") -- (ErrSnapshotNotCompatible snap
+                      --    "union tables are not supported in SnapshotReader mode"
+                      --    "use ReadWrite session to open snapshots with union tables")
+            tableLevels <- fromSnapLevelsReadOnly reg (sessionRefCtx seshEnv) snapLevels'
+            traverse_ (delayedCommit reg . releaseRef) snapLevels'
+            tableCache <- mkLevelsCache reg tableLevels
+            newWith reg sesh seshEnv conf am tr tableId (Just snapLock) $! TableContent
+              { tableWriteBuffer, tableWriteBufferBlobs, tableLevels
+              , tableCache, tableUnionLevel = NoUnion }
 
 {-# SPECIALISE wrapFileCorruptedErrorAsSnapshotCorruptedError ::
        SnapshotName
@@ -1858,7 +1989,7 @@ doesSnapshotDirExist snap seshEnv = do
   -> IO () #-}
 -- |  See 'Database.LSMTree.deleteSnapshot'.
 deleteSnapshot ::
-     (MonadMask m, MonadSTM m)
+     forall m h. (MonadMask m, MonadSTM m)
   => Session m h
   -> SnapshotName
   -> m ()
@@ -1866,9 +1997,29 @@ deleteSnapshot sesh snap = do
     traceWith (sessionTracer sesh) $ TraceDeleteSnapshot snap
     withKeepSessionOpen sesh $ \seshEnv -> do
       let snapDir = Paths.namedSnapshotDir (sessionRoot seshEnv) snap
+          hbio    = sessionHasBlockIO seshEnv
+          lockPath = Paths.snapshotLockFile snapDir
       snapshotExists <- doesSnapshotDirExist snap seshEnv
       unless snapshotExists $ throwIO (ErrSnapshotDoesNotExist snap)
-      FS.removeDirectoryRecursive (sessionHasFS seshEnv) (Paths.getNamedSnapshotDir snapDir)
+      -- Acquire an exclusive lock before deletion. If any reader holds a
+      -- shared lock, tryLockFile returns Nothing (or throws FsResourceAlreadyInUse)
+      -- and we throw ErrSnapshotInUse rather than block.
+      eLock <- try @m @FsError $ FS.tryLockFile hbio lockPath FS.ExclusiveLock
+      mLock <- case eLock of
+        Left e
+          | FS.FsResourceAlreadyInUse <- FS.fsErrorType e
+          -> throwIO (ErrSnapshotInUse snap)
+        Left e  -> throwIO e
+        Right r -> pure r
+      case mLock of
+        Nothing   -> throwIO (ErrSnapshotInUse snap)
+        Just lock -> do
+          -- On POSIX, removeDirectoryRecursive unlinks the lock file while
+          -- the handle is still open, which is safe. The exclusive lock is
+          -- maintained until hUnlock is called below.
+          FS.removeDirectoryRecursive (sessionHasFS seshEnv)
+                                      (Paths.getNamedSnapshotDir snapDir)
+          FS.hUnlock lock
     traceWith (sessionTracer sesh) $ TraceDeletedSnapshot snap
 
 {-# SPECIALISE listSnapshots :: Session IO h -> IO [SnapshotName] #-}
@@ -1927,6 +2078,7 @@ duplicate t@Table{..} = do
             tableArenaManager
             childTableTracer
             childTableId
+            Nothing
             content
 
 {-------------------------------------------------------------------------------
@@ -2042,7 +2194,7 @@ unionsInOpenSession reg sesh seshEnv conf tr !tableId ts = do
     -- by reusing the arena manager from the last one.
     let am = tableArenaManager (NE.last ts)
 
-    newWith reg sesh seshEnv conf am tr tableId content
+    newWith reg sesh seshEnv conf am tr tableId Nothing content
 
 {-# SPECIALISE tableContentToMergingTree ::
      UniqCounter IO

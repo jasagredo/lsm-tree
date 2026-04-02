@@ -26,6 +26,7 @@ module Database.LSMTree.Internal.Run (
   , RunParams (..)
     -- * Snapshot
   , openFromDisk
+  , openFromDiskInPlace
   , RunDataCaching (..)
   , IndexType (..)
   ) where
@@ -162,6 +163,17 @@ finaliser hfs kopsFile blobFile fsPaths = do
     FS.removeFile hfs (runFilterPath fsPaths)
     FS.removeFile hfs (runIndexPath fsPaths)
     FS.removeFile hfs (runChecksumsPath fsPaths)
+
+{-# SPECIALISE finaliserInPlace ::
+     HasFS IO h -> FS.Handle h -> Ref (BlobFile IO h) -> IO () #-}
+-- | Like 'finaliser' but does not delete the run files. Use when run files are
+-- owned by a snapshot directory, not the active directory.
+finaliserInPlace ::
+     (MonadSTM m, MonadMask m, PrimMonad m)
+  => HasFS m h -> FS.Handle h -> Ref (BlobFile m h) -> m ()
+finaliserInPlace hfs kopsFile blobFile = do
+    FS.hClose hfs kopsFile
+    releaseRef blobFile
 
 {-# SPECIALISE setRunDataCaching ::
      HasBlockIO IO h
@@ -344,6 +356,62 @@ openFromDisk fs hbio refCtx runRunDataCaching indexType expectedSalt runRunFsPat
     -- Note: all file data for this path is evicted from the page cache /if/ the
     -- caching argument is 'NoCacheRunData'.
     checkCRC :: RunDataCaching -> CRC.CRC32C -> FS.FsPath -> m ()
+    checkCRC cache expected fp =
+      CRC.checkCRC fs hbio (cache == NoCacheRunData) expected fp
+
+    -- Note: all file data for this path is evicted from the page cache
+    readCRC :: CRC.CRC32C -> FS.FsPath -> m SBS.ShortByteString
+    readCRC expected fp = FS.withFile fs fp FS.ReadMode $ \h -> do
+        n <- FS.hGetSize fs h
+        -- double the file readahead window (only applies to this file descriptor)
+        FS.hAdviseAll hbio h FS.AdviceSequential
+        (sbs, !checksum) <- CRC.hGetExactlyCRC32C_SBS fs h (fromIntegral n) CRC.initialCRC32C
+        -- drop the file from the OS page cache
+        FS.hAdviseAll hbio h FS.AdviceDontNeed
+        CRC.expectChecksum fs fp expected checksum
+        pure sbs
+
+{-# SPECIALISE openFromDiskInPlace ::
+     HasFS IO h -> HasBlockIO IO h -> RefCtx
+  -> RunDataCaching -> IndexType -> Bloom.Salt -> RunFsPaths
+  -> IO (Ref (Run IO h)) #-}
+-- | Like 'openFromDisk' but opens files in-place without taking ownership.
+-- Run files are not deleted when the 'Run' is released. Use in
+-- 'SnapshotReader' sessions.
+openFromDiskInPlace ::
+     forall m h. (MonadSTM m, MonadMask m, PrimMonad m)
+  => HasFS m h -> HasBlockIO m h -> RefCtx
+  -> RunDataCaching -> IndexType -> Bloom.Salt -> RunFsPaths
+  -> m (Ref (Run m h))
+openFromDiskInPlace fs hbio refCtx runRunDataCaching indexType expectedSalt runRunFsPaths = do
+    expectedChecksums <-
+       CRC.expectValidFile fs (runChecksumsPath runRunFsPaths) CRC.FormatChecksumsFile
+           . fromChecksumsFile
+         =<< CRC.readChecksumsFile fs (runChecksumsPath runRunFsPaths)
+
+    -- verify checksums of files we don't read yet
+    let paths = pathsForRunFiles runRunFsPaths
+    checkCRC runRunDataCaching (forRunKOpsRaw expectedChecksums) (forRunKOpsRaw paths)
+    checkCRC runRunDataCaching (forRunBlobRaw expectedChecksums) (forRunBlobRaw paths)
+
+    -- read and try parsing files
+    let filterPath = forRunFilterRaw paths
+    checkCRC CacheRunData (forRunFilterRaw expectedChecksums) filterPath
+    runFilter <- FS.withFile fs filterPath FS.ReadMode $
+                   bloomFilterFromFile fs expectedSalt
+
+    (runNumEntries, runIndex) <-
+      CRC.expectValidFile fs (forRunIndexRaw paths) CRC.FormatIndexFile
+          . Index.fromSBS indexType
+        =<< readCRC (forRunIndexRaw expectedChecksums) (forRunIndexRaw paths)
+
+    runKOpsFile <- FS.hOpen fs (runKOpsPath runRunFsPaths) FS.ReadMode
+    runBlobFile <- openBlobFileShared fs refCtx (runBlobPath runRunFsPaths) FS.ReadMode
+    setRunDataCaching hbio runKOpsFile runRunDataCaching
+    -- this usage of @finaliserInPlace@ is the one that differs from the above
+    newRef refCtx (finaliserInPlace fs runKOpsFile runBlobFile) $ \runRefCounter ->
+      Run { runHasFS = fs, runHasBlockIO = hbio, .. }
+  where
     checkCRC cache expected fp =
       CRC.checkCRC fs hbio (cache == NoCacheRunData) expected fp
 

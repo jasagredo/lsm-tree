@@ -24,6 +24,7 @@ module Database.LSMTree.Internal.WriteBufferBlobs (
     WriteBufferBlobs (..),
     new,
     open,
+    fromBlobFile,
     addBlob,
     mkRawBlobRef,
     mkWeakBlobRef,

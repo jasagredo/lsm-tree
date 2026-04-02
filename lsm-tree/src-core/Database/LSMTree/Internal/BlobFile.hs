@@ -5,6 +5,7 @@ module Database.LSMTree.Internal.BlobFile (
     BlobFile (..)
   , BlobSpan (..)
   , openBlobFile
+  , openBlobFileShared
   , readBlob
   , readBlobRaw
   , writeBlob
@@ -77,6 +78,27 @@ openBlobFile fs refCtx path mode =
               -- surprise errors when the file is also deleted elsewhere. Maybe
               -- file paths should be guarded by 'Ref's as well?
               FS.removeFile fs (FS.handlePath blobFileHandle)
+      newRef refCtx finaliser $ \blobFileRefCounter ->
+        BlobFile {
+          blobFileHandle,
+          blobFileRefCounter
+        }
+
+-- | Like 'openBlobFile' but the finaliser only closes the handle; it does NOT
+-- delete the file. Use when the caller does not own the file lifetime, e.g.
+-- when opening run files in-place from a snapshot directory.
+{-# SPECIALISE openBlobFileShared :: HasCallStack => HasFS IO h -> RefCtx -> FS.FsPath -> FS.OpenMode -> IO (Ref (BlobFile IO h)) #-}
+openBlobFileShared ::
+     (PrimMonad m, MonadCatch m)
+  => HasCallStack
+  => HasFS m h
+  -> RefCtx
+  -> FS.FsPath
+  -> FS.OpenMode
+  -> m (Ref (BlobFile m h))
+openBlobFileShared fs refCtx path mode =
+    bracketOnError (FS.hOpen fs path mode) (FS.hClose fs) $ \blobFileHandle -> do
+      let finaliser = FS.hClose fs blobFileHandle
       newRef refCtx finaliser $ \blobFileRefCounter ->
         BlobFile {
           blobFileHandle,

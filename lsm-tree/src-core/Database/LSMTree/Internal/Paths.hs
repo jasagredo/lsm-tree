@@ -16,6 +16,7 @@ module Database.LSMTree.Internal.Paths (
   , snapshotsDir
   , NamedSnapshotDir (..)
   , namedSnapshotDir
+  , snapshotLockFile
   , SnapshotMetaDataFile (..)
   , snapshotMetaDataFile
   , SnapshotMetaDataChecksumFile (..)
@@ -195,6 +196,11 @@ newtype NamedSnapshotDir = NamedSnapshotDir { getNamedSnapshotDir :: FsPath }
 namedSnapshotDir :: SessionRoot -> SnapshotName -> NamedSnapshotDir
 namedSnapshotDir root (SnapshotName name) =
     NamedSnapshotDir (snapshotsDir root </> mkFsPath [name])
+
+-- | Lock on the snapshot, to be acquired in shared read mode by readers and on
+-- exclusive write mode by deleters.
+snapshotLockFile :: NamedSnapshotDir -> FsPath
+snapshotLockFile (NamedSnapshotDir dir) = dir </> mkFsPath ["lock"]
 
 newtype SnapshotMetaDataFile = SnapshotMetaDataFile FsPath
 

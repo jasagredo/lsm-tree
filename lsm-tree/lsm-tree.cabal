@@ -812,6 +812,22 @@ test-suite lsm-tree-test
 
   ghc-options:     -threaded
 
+executable snapshot-reader-demo
+  import:          language
+  hs-source-dirs:  demo
+  main-is:         SnapshotReader.hs
+  build-depends:
+    , base           <5
+    , blockio
+    , contra-tracer
+    , fs-api
+    , io-classes
+    , lsm-tree:core
+    , lsm-tree
+    , temporary
+    , vector
+  ghc-options:     -threaded
+
 benchmark lsm-tree-micro-bench
   import:         language, warnings, wno-x-partial
   type:           exitcode-stdio-1.0
