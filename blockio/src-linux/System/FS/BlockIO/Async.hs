@@ -7,12 +7,12 @@ import qualified Control.Exception as E
 import           Control.Monad (when)
 import           Control.Monad.Primitive
 import           Data.Primitive.ByteArray (mutableByteArrayContents,
-                     sizeofMutableByteArray)
+                     getSizeofMutableByteArray)
 import qualified Data.Vector as V
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Unboxed.Mutable as VUM
 import           Foreign.C.Error
-import           Foreign.C.Types (CSize (..), CSsize (..))
+import           Foreign.C.Types (CSize (..), CInt (..))
 import           Foreign.Ptr (Ptr, plusPtr, ptrToIntPtr)
 import           Foreign.Storable (poke)
 import           Data.Word (Word8)
@@ -143,7 +143,7 @@ foreign import ccall unsafe "pread"
 diagEFAULT :: IOOp RealWorld HandleIO -> IO ()
 diagEFAULT (IOOpRead h off buf bufOff cnt) = do
     let ptr = mutableByteArrayContents buf `plusPtr` unBufferOffset bufOff
-        sz  = sizeofMutableByteArray buf
+    sz <- getSizeofMutableByteArray buf
     IO.hPutStrLn IO.stderr $ concat
       [ "EFAULT diag: ptr=0x", show (ptrToIntPtr ptr)
       , " mba_size=", show sz
@@ -162,11 +162,11 @@ diagEFAULT (IOOpRead h off buf bufOff cnt) = do
       Left err ->
         IO.hPutStrLn IO.stderr $ "  handle closed: " <> show err
       Right (Fd fdCInt) -> do
-        n <- c_pread fdCInt ptr (fromIntegral cnt) off
+        n <- c_pread fdCInt ptr cnt off
         if n < 0
           then do
             errno <- getErrno
-            IO.hPutStrLn IO.stderr $ "  pread: FAILED errno=" <> show errno
+            IO.hPutStrLn IO.stderr $ "  pread: FAILED errno=" <> show ((\(Errno c) -> show c) errno)
           else
             IO.hPutStrLn IO.stderr $ "  pread: OK " <> show n <> " bytes"
     IO.hFlush IO.stderr
