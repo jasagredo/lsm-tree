@@ -74,13 +74,12 @@ submitIO ::
 submitIO hasFS ioctx ioops = do
     ioops' <- mapM ioopConv ioops
     ress <- I.submitIO ioctx ioops' `catch` rethrowFsError
+    -- Pre-scan results. On any EFAULT, dump the entire batch before rethrow.
+    dumpBatchOnEFAULT ioops ress
     hzipWithM rethrowErrno ioops ress
   where
     rethrowFsError :: IOError -> IO a
     rethrowFsError e@IOError{}
-      -- Pattern matching on the error is brittle, because the structure of
-      -- the exception might change between versions of @blockio-uring@.
-      -- Nonetheless, it's better than nothing.
       | isResourceVanishedError e
       , ioe_location e == "IOCtx closed"
       = throwIO (IOI.mkClosedError hasFS "submitIO")
@@ -89,6 +88,51 @@ submitIO hasFS ioctx ioops = do
       = throwIO (IOI.mkNotPinnedError hasFS "submitIO")
       | otherwise
       = throwIO e
+
+    dumpBatchOnEFAULT ::
+         V.Vector (IOOp RealWorld HandleIO)
+      -> VU.Vector I.IOResult
+      -> IO ()
+    dumpBatchOnEFAULT ops results = do
+        let n = VU.length results
+            hasEFAULT = any (\i -> case results VU.! i of
+                                     I.IOError (Errno e) -> e == 14 || e == (-14)
+                                     _                   -> False)
+                           [0 .. n - 1]
+        when hasEFAULT $ do
+          IO.hPutStrLn IO.stderr $ "=== EFAULT batch dump (batch size " <> show n <> ") ==="
+          mapM_ (dumpOne ops results) [0 .. n - 1]
+          IO.hFlush IO.stderr
+
+    dumpOne ops results i = do
+        let op = ops V.! i
+            r  = results VU.! i
+            resStr = case r of
+              I.IOResult c        -> "OK " <> show c
+              I.IOError (Errno e) -> "ERR errno=" <> show e
+        case op of
+          IOOpRead h off buf bufOff cnt -> do
+            let ptr = mutableByteArrayContents buf `plusPtr` unBufferOffset bufOff
+            sz <- getSizeofMutableByteArray buf
+            IO.hPutStrLn IO.stderr $ concat
+              [ "  [", show i, "] READ ", resStr
+              , " ptr=0x", show (ptrToIntPtr ptr)
+              , " mba_sz=", show sz
+              , " bufOff=", show (unBufferOffset bufOff)
+              , " fileOff=", show off
+              , " cnt=", show cnt
+              , " path=", show (handlePath h)
+              ]
+          IOOpWrite h off buf bufOff cnt -> do
+            let ptr = mutableByteArrayContents buf `plusPtr` unBufferOffset bufOff
+            IO.hPutStrLn IO.stderr $ concat
+              [ "  [", show i, "] WRITE ", resStr
+              , " ptr=0x", show (ptrToIntPtr ptr)
+              , " bufOff=", show (unBufferOffset bufOff)
+              , " fileOff=", show off
+              , " cnt=", show cnt
+              , " path=", show (handlePath h)
+              ]
 
     rethrowErrno ::
          HasCallStack
