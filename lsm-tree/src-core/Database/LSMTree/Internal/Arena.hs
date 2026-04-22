@@ -77,6 +77,7 @@ newBlock :: PrimMonad m => m (Block (PrimState m))
 newBlock = do
     off <- newPrimVar 0
     mba <- newAlignedPinnedByteArray blockSize 4096
+    fillByteArray mba 0 blockSize 0
     pure (Block off mba)
 
 {-# INLINE withArena #-}
