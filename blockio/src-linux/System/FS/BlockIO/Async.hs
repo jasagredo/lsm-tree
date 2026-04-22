@@ -4,11 +4,18 @@ module System.FS.BlockIO.Async (
 
 import           Control.Exception
 import qualified Control.Exception as E
+import           Control.Monad (when)
 import           Control.Monad.Primitive
+import           Data.Primitive.ByteArray (mutableByteArrayContents,
+                     sizeofMutableByteArray)
 import qualified Data.Vector as V
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Unboxed.Mutable as VUM
 import           Foreign.C.Error
+import           Foreign.C.Types (CSize (..), CSsize (..))
+import           Foreign.Ptr (Ptr, plusPtr, ptrToIntPtr)
+import           Foreign.Storable (poke)
+import           Data.Word (Word8)
 import           GHC.IO.Exception
 import           GHC.Stack
 import           System.FS.API (BufferOffset (..), FsErrorPath, FsPath,
@@ -19,6 +26,7 @@ import           System.FS.BlockIO.API (IOOp (..), IOResult (..), LockMode,
 import qualified System.FS.BlockIO.IO.Internal as IOI
 import           System.FS.IO (HandleIO)
 import           System.FS.IO.Handle
+import qualified System.IO as IO
 import qualified System.IO.BlockIO as I
 import           System.IO.Error (ioeGetErrorType, ioeSetErrorString,
                      isResourceVanishedError)
@@ -90,7 +98,10 @@ submitIO hasFS ioctx ioops = do
     rethrowErrno ioop res = do
         case res of
           I.IOResult c -> pure (IOResult c)
-          I.IOError  e -> throwAsFsError e
+          I.IOError  e -> do
+            when (e == Errno 14 || e == Errno (-14)) $
+              diagEFAULT ioop
+            throwAsFsError e
       where
         throwAsFsError :: HasCallStack => Errno -> IO a
         throwAsFsError errno = E.throwIO $ ioToFsError fep (fromErrno errno)
@@ -124,6 +135,43 @@ ioopConv (IOOpWrite h off buf bufOff c) = handleFd h >>= \fd ->
 -- would require a change in @fs-api@. See [fs-sim#49].
 handleFd :: Handle HandleIO -> IO Fd
 handleFd h = withOpenHandle "submitIO" (handleRaw h) pure
+
+-- Diagnostic: on EFAULT, print buffer info and try synchronous pread
+foreign import ccall unsafe "pread"
+  c_pread :: CInt -> Ptr a -> CSize -> FileOffset -> IO CSsize
+
+diagEFAULT :: IOOp RealWorld HandleIO -> IO ()
+diagEFAULT (IOOpRead h off buf bufOff cnt) = do
+    let ptr = mutableByteArrayContents buf `plusPtr` unBufferOffset bufOff
+        sz  = sizeofMutableByteArray buf
+    IO.hPutStrLn IO.stderr $ concat
+      [ "EFAULT diag: ptr=0x", show (ptrToIntPtr ptr)
+      , " mba_size=", show sz
+      , " bufOff=", show (unBufferOffset bufOff)
+      , " fileOff=", show off
+      , " count=", show cnt
+      , " path=", show (handlePath h)
+      ]
+    -- Test 1: can we write to the buffer from Haskell?
+    writeRes <- E.try @E.SomeException $ poke ptr (0 :: Word8)
+    IO.hPutStrLn IO.stderr $ "  userspace write: " <>
+      either (\e -> "FAILED " <> show e) (const "OK") writeRes
+    -- Test 2: try synchronous pread into the same buffer
+    fdRes <- E.try @E.SomeException $ handleFd h
+    case fdRes of
+      Left err ->
+        IO.hPutStrLn IO.stderr $ "  handle closed: " <> show err
+      Right (Fd fdCInt) -> do
+        n <- c_pread fdCInt ptr (fromIntegral cnt) off
+        if n < 0
+          then do
+            errno <- getErrno
+            IO.hPutStrLn IO.stderr $ "  pread: FAILED errno=" <> show errno
+          else
+            IO.hPutStrLn IO.stderr $ "  pread: OK " <> show n <> " bytes"
+    IO.hFlush IO.stderr
+diagEFAULT IOOpWrite{} =
+    IO.hPutStrLn IO.stderr "EFAULT diag: on IOOpWrite (unexpected)"
 
 {-# SPECIALISE hzipWithM ::
      (VUM.Unbox b, VUM.Unbox c)
